@@ -34,6 +34,10 @@ def main():
     p.add_argument("--session",    required=True, help="Session directory path")
     p.add_argument("--n-top",      type=int, default=20)
     p.add_argument("--checkpoint", default=str(GN_DIR/"checkpoints"/"checkpoint-rs.tar"))
+    p.add_argument("--approach-cone-deg", type=float, default=45.0,
+                   help="Allow approach XY within this many degrees of +Y (default: 45)")
+    p.add_argument("--approach-y-min", type=float, default=0.0,
+                   help="Minimum approach Y component (default: 0 = must have +Y)")
     args = p.parse_args()
 
     session   = Path(args.session)
@@ -78,6 +82,37 @@ def main():
     gg         = infer_grasps(net, obj_pts, n_top=max(args.n_top * 15, 100))
     candidates = graspgroup_to_candidates(gg, scale_factor=1.0, z_approach_max=0.3)
     candidates = rerank_for_reachability(candidates)
+
+    # ── Approach direction cone filter ────────────────────────
+    # Keep grasps whose XY approach projection is within ±cone_deg of +Y axis.
+    # approach = R[:,2] (A2G convention), in z0 frame.
+    # +Y axis in XY plane = [0, 1]. Angle = arctan2(|app_x|, app_y).
+    # Allow if app_y >= cos(cone_deg) * |app_xy| AND app_y > 0
+    cone_rad  = np.radians(args.approach_cone_deg)
+    cos_limit = np.cos(cone_rad)
+
+    def _in_y_cone(c):
+        app = np.array(c['rotation'])[:, 2]   # A2G col2 = approach
+        app_xy_mag = np.linalg.norm(app[:2])
+        if app_xy_mag < 0.05:                  # ~top-down: XY direction undefined → allow
+            return True
+        # Must have positive Y (approaching from -Y side)
+        if app[1] < args.approach_y_min:
+            return False
+        # XY angle from +Y must be <= cone_deg
+        cos_angle = app[1] / app_xy_mag        # dot([app_x,app_y], [0,1]) / mag
+        return cos_angle >= cos_limit
+
+    n_before = len(candidates)
+    candidates = [c for c in candidates if _in_y_cone(c)]
+    n_removed  = n_before - len(candidates)
+    print(f"  Approach cone filter (±{args.approach_cone_deg:.0f}° from +Y): "
+          f"removed {n_removed} → {len(candidates)} remain")
+
+    if not candidates:
+        sys.exit("❌ No candidates after approach cone filter. "
+                 "Try --approach-cone-deg 90 to relax.")
+
     candidates = candidates[:args.n_top]
 
     if not candidates:
@@ -119,6 +154,9 @@ def main():
             "approach_type":   "graspnet",
         })
 
+    print(f"\n  ✅ {len(out_candidates)} candidates "
+          f"(z_approach≤0.3 + ±{args.approach_cone_deg:.0f}°-Y cone + {SHIFT_M*100:.1f}cm shift)")
+
     out = {
         "schema_version": "1.1",
         "mesh_frame":     "base_aligned_z0",
@@ -134,6 +172,8 @@ def main():
             "pre_grasp_offset_m":    0.15,
             "lift_height_m":         0.15,
             "depth_shift_m":         SHIFT_M,
+            "approach_cone_deg":     args.approach_cone_deg,
+            "approach_main_axis":    "+Y (from -Y side)",
         },
         "n_candidates": len(out_candidates),
         "candidates":   out_candidates,
@@ -144,11 +184,16 @@ def main():
     inference_dir.mkdir(parents=True, exist_ok=True)
     out_path = inference_dir / "candidates.json"
 
-    # Backup existing PDM candidates if present
+    # Backup existing candidates if present (don't overwrite GraspNet with GraspNet)
     if out_path.exists():
-        bak = inference_dir / "candidates_pdm_backup.json"
+        import json as _j
+        existing = _j.load(open(out_path))
+        bak_name = ("candidates_pdm_backup.json"
+                    if existing.get("inference_method") != "graspnet"
+                    else "candidates_graspnet_prev.json")
+        bak = inference_dir / bak_name
         out_path.rename(bak)
-        print(f"\n  📦 Backed up PDM candidates → {bak.name}")
+        print(f"  📦 Backed up previous candidates → {bak.name}")
 
     tmp = out_path.with_suffix(".json.tmp")
     with open(tmp, "w") as f:
