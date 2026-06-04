@@ -124,12 +124,11 @@ def main():
         c['position'] = np.array(c['position']) + approach * SHIFT_M
     print(f"\n  ✅ {len(candidates)} candidates (A2G + z_approach≤0.3 + {SHIFT_M*100:.1f}cm shift)")
 
-    # ── 5. T_base_z0 ──────────────────────────────────────────
+    # ── 5. T_base_aligned (original, no z0 shift) ─────────────
     with open(tbm_path) as f:
-        T_base_mesh = np.array(json.load(f)["T_base_mesh"])
-    T_shift_inv       = np.eye(4); T_shift_inv[2, 3] = -z_shift
-    T_base_z0         = T_base_mesh @ T_shift_inv
-    print(f"  T_base_z0 t: [{T_base_z0[0,3]:.3f},{T_base_z0[1,3]:.3f},{T_base_z0[2,3]:.3f}]m")
+        T_base_aligned = np.array(json.load(f)["T_base_mesh"])
+    print(f"  T_base_aligned t: [{T_base_aligned[0,3]:.3f},{T_base_aligned[1,3]:.3f},{T_base_aligned[2,3]:.3f}]m")
+    print(f"  (z_shift={z_shift*100:.1f}cm subtracted from grasp_point Z → base_aligned frame)")
 
     # ── 6. Build V2AP candidates.json ─────────────────────────
     out_candidates = []
@@ -137,18 +136,24 @@ def main():
         gp  = c['position']
         rot = np.array(c['rotation'])
         app = np.array(c['approach'])
-        # Sanity: show base-frame grasp position
-        T_z0_g = np.eye(4); T_z0_g[:3,:3] = rot; T_z0_g[:3,3] = gp
-        T_base_g = T_base_z0 @ T_z0_g
+        # Transform grasp_point from z0 frame → base_aligned frame:
+        #   base_aligned = z0 - [0, 0, z_shift]
+        # GraspNet ran in z0 (for correct table collision at z=0),
+        # but we output in base_aligned so origin = object centroid (same as PDM).
+        gp_aligned = np.array([gp[0], gp[1], gp[2] - z_shift])
+
+        # Sanity: verify base-frame position unchanged
+        T_ba_g = np.eye(4); T_ba_g[:3,:3] = rot; T_ba_g[:3,3] = gp_aligned
+        T_base_g = T_base_aligned @ T_ba_g
         if i < 3:
             print(f"  [{i}] score={c['score']:.3f} "
-                  f"pt_z0=[{gp[0]:.3f},{gp[1]:.3f},{gp[2]:.3f}] "
+                  f"pt_aligned=[{gp_aligned[0]:.3f},{gp_aligned[1]:.3f},{gp_aligned[2]:.3f}] "
                   f"pt_base=[{T_base_g[0,3]:.3f},{T_base_g[1,3]:.3f},{T_base_g[2,3]:.3f}]")
         out_candidates.append({
             "rank":            i,
             "name":            f"graspnet_{i:03d}",
             "score":           round(float(c['score']), 4),
-            "grasp_point":     [round(float(x), 6) for x in gp],
+            "grasp_point":     [round(float(x), 6) for x in gp_aligned],
             "rotation":        [[round(float(x), 6) for x in row] for row in rot],
             "gripper_width_m": round(float(c['gripper_width']), 5),
             "approach_type":   "graspnet",
@@ -159,14 +164,14 @@ def main():
 
     out = {
         "schema_version": "1.1",
-        "mesh_frame":     "base_aligned_z0",
+        "mesh_frame":     "base_aligned",
         "inference_method": "graspnet",
-        "T_base_mesh":    [[round(float(x), 8) for x in row] for row in T_base_z0.tolist()],
+        "T_base_mesh":    [[round(float(x), 8) for x in row] for row in T_base_aligned.tolist()],
         "mesh_span_m":    [round(x, 4) for x in mesh_span],
         "conventions": {
             "rotation_columns":      ["finger_open", "y_body", "approach"],
             "approach_column_index": 2,
-            "grasp_point_frame":     "base_aligned_z0",
+            "grasp_point_frame":     "base_aligned",
             "ucb_tcp_offset_m":      0.105,
             "ucb_tcp_frame":         "panda_hand",
             "pre_grasp_offset_m":    0.15,
