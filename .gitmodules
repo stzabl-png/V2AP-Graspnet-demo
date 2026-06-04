@@ -1,0 +1,3 @@
+[submodule "third_party/graspnet-baseline"]
+	path = third_party/graspnet-baseline
+	url = https://github.com/graspnet/graspnet-baseline.git

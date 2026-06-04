@@ -1,0 +1,25 @@
+# GraspNet checkpoint (large, download separately)
+checkpoints/checkpoint-rs.tar
+checkpoints/*.tar
+
+# Session data (keep only example structure, not real data)
+sessions/*/output/mesh/*.glb
+sessions/*/output/register/
+sessions/*/output/graspnet/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+dist/
+build/
+.venv/
+venv/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+*.swp
