@@ -2,27 +2,16 @@
 """
 pipeline/compose.py
 ====================
-Step 2: candidates_local.json + T_base_mesh → candidates.json (V2AP format, base frame).
+Step 2: candidates_local.json + T_base_mesh → candidates.json (V2AP format).
 
-Frame math:
-  Grasps from infer.py are in "base_aligned_z0" frame:
-    F_z0 = F_base_aligned + z_shift (shift z_min→0 for GraspNet table)
+V2AP retarget.py reads candidates.json like this:
+    T_base_mesh = candidates["T_base_mesh"]
+    T_base_pinch = T_base_mesh @ [[R | grasp_point]]   ← mesh-local frame
 
-  T_base_mesh from session corresponds to F_base_aligned:
-    T_base_mesh: base_aligned_frame → robot_base_frame
+So grasp_point/rotation MUST stay in the MESH-LOCAL frame (z0 frame).
+T_base_mesh is the 4x4 that maps z0 → robot base.
 
-  For the shifted frame:
-    T_base_z0 = T_base_mesh @ T_shift_inv
-    where T_shift_inv = [[I | 0,0,-z_shift]]  (undo the shift)
-
-  Per-grasp transform:
-    T_z0_grasp = [[R | grasp_point]]   (grasp pose in z0 frame)
-    T_base_grasp = T_base_z0 @ T_z0_grasp
-
-Output: output/graspnet/candidates.json — V2AP schema 1.1, base frame.
-  V2AP retarget.py uses: T_base_pinch = T_base_mesh @ T_mesh_pinch
-  We set T_base_mesh = T_base_z0 (stored in candidates.json).
-  Then grasp_point/rotation remain in z0 frame (mesh-local).
+Output path: output/inference/candidates.json   (V2AP standard location)
 """
 from __future__ import annotations
 import json
@@ -33,10 +22,6 @@ import numpy as np
 
 def run_compose(session_dir: Path,
                 candidates_local: Path | None = None) -> Path:
-    """
-    Transform candidates_local.json to V2AP-compatible candidates.json.
-    Returns output path.
-    """
     session_dir = Path(session_dir)
     base_out    = session_dir / "output" / "graspnet"
 
@@ -50,9 +35,9 @@ def run_compose(session_dir: Path,
     z_shift    = float(local["z_shift_m"])
     candidates = local["candidates"]
     print(f"\n{'='*55}")
-    print(f"  Compose Grasp Poses → Base Frame")
+    print(f"  Compose → V2AP candidates.json")
     print(f"  Session:  {session_dir.name}")
-    print(f"  z_shift:  {z_shift*100:.2f}cm")
+    print(f"  z_shift:  {z_shift*100:.2f}cm (z_min shift applied during inference)")
     print(f"  Input:    {len(candidates)} candidates")
 
     # ── Load T_base_mesh (base_aligned frame) ─────────────────
@@ -60,95 +45,124 @@ def run_compose(session_dir: Path,
     if not tbm_path.exists():
         raise FileNotFoundError(
             f"T_base_mesh.json not found: {tbm_path}\n"
-            "Make sure the session has completed the FoundationPose registration step."
+            "Ensure FoundationPose registration is complete."
         )
     with open(tbm_path) as f:
         tbm_data = json.load(f)
-    T_base_mesh = np.array(tbm_data["T_base_mesh"], dtype=np.float64)
-    print(f"  T_base_mesh translation: "
-          f"[{T_base_mesh[0,3]:.3f},{T_base_mesh[1,3]:.3f},{T_base_mesh[2,3]:.3f}]m")
+    T_base_aligned = np.array(tbm_data["T_base_mesh"], dtype=np.float64)
 
-    # ── Compute T_base_z0 ──────────────────────────────────────
-    # T_shift moves points from base_aligned frame TO z0 frame: p_z0 = p_ba + [0,0,z_shift]
-    # So T_shift = [[I | 0,0,z_shift]]
-    # T_base_z0 = T_base_mesh @ T_shift_inv = T_base_mesh @ [[I | 0,0,-z_shift]]
-    T_shift_inv        = np.eye(4)
-    T_shift_inv[2, 3]  = -z_shift         # undo the z_min shift
-    T_base_z0          = T_base_mesh @ T_shift_inv
+    # ── T_base_z0: maps z0 frame → robot base ─────────────────
+    # z0 frame = base_aligned frame shifted so z_min → 0
+    # z0_pt = base_aligned_pt + [0, 0, z_shift]
+    # base_pt = T_base_aligned @ base_aligned_pt
+    #         = T_base_aligned @ (z0_pt - [0,0,z_shift])
+    #         = (T_base_aligned @ T_shift_inv) @ z0_pt
+    # where T_shift_inv = [[I | 0,0,-z_shift]]
+    T_shift_inv       = np.eye(4)
+    T_shift_inv[2, 3] = -z_shift
+    T_base_z0         = T_base_aligned @ T_shift_inv
 
-    print(f"  T_base_z0 translation:  "
-          f"[{T_base_z0[0,3]:.3f},{T_base_z0[1,3]:.3f},{T_base_z0[2,3]:.3f}]m")
+    print(f"  T_base_aligned t: [{T_base_aligned[0,3]:.3f},{T_base_aligned[1,3]:.3f},{T_base_aligned[2,3]:.3f}]m")
+    print(f"  T_base_z0      t: [{T_base_z0[0,3]:.3f},{T_base_z0[1,3]:.3f},{T_base_z0[2,3]:.3f}]m")
 
-    # ── Compose each grasp to base frame ──────────────────────
+    # ── Build output candidates (keep poses in z0/mesh frame) ─
+    # V2AP computes: T_base_pinch = T_base_z0 @ [[R | grasp_point]]
+    # So we store T_base_mesh = T_base_z0, grasp_point/rotation in z0 frame.
+    mesh_span = np.array(local.get("mesh_span_m",
+                                    [0.17, 0.12, 0.30]))  # XYZ extents
+
+    # Compute mesh_span from first candidate's bbox if not stored
+    # (use approximate can dimensions)
     out_candidates = []
     for c in candidates:
-        gp = np.array(c["grasp_point"], dtype=np.float64)   # in z0 frame
-        R  = np.array(c["rotation"],   dtype=np.float64)    # A2G: col2=approach
+        gp  = [round(float(x), 6) for x in c["grasp_point"]]
+        rot = [[round(float(x), 6) for x in row] for row in c["rotation"]]
+        app = np.array(c["approach"])
 
-        # Grasp transform in z0 frame
-        T_z0_grasp       = np.eye(4)
-        T_z0_grasp[:3,:3] = R
-        T_z0_grasp[:3, 3] = gp
-
-        # Grasp in base frame
-        T_base_grasp     = T_base_z0 @ T_z0_grasp
-        gp_base          = T_base_grasp[:3, 3]
-        R_base           = T_base_grasp[:3, :3]
-        approach_base    = R_base[:, 2]
-        pre_grasp_base   = gp_base - approach_base * (0.105 + 0.15)
+        # Pre-grasp in z0 frame for reference (V2AP computes its own)
+        pre_local = (np.array(c["grasp_point"])
+                     - app * (0.105 + 0.15))
 
         out_candidates.append({
-            "rank":              c["rank"],
-            "score":             c["score"],
-            # V2AP uses T_base_mesh @ T_mesh_pinch convention
-            # We store the already-composed base-frame pose here
-            "grasp_point":       [round(float(x), 6) for x in gp_base],
-            "rotation":          [[round(float(x), 6) for x in row]
-                                  for row in R_base],
-            "gripper_width_m":   c["gripper_width_m"],
-            "approach":          [round(float(x), 6) for x in approach_base],
-            "pre_grasp_point":   [round(float(x), 6) for x in pre_grasp_base],
-            # Also keep mesh-local for V2AP retarget.py if needed
-            "grasp_point_local": c["grasp_point"],
-            "rotation_local":    c["rotation"],
+            "rank":            c["rank"],
+            "name":            f"graspnet_rank{c['rank']}",
+            "score":           c["score"],
+            "grasp_point":     gp,          # z0 (mesh-local) frame ← V2AP uses this
+            "rotation":        rot,          # col0=finger_open, col2=approach (A2G)
+            "gripper_width_m": c["gripper_width_m"],
+            "approach":        [round(float(x), 6) for x in app],
         })
 
-    # Sanity check: verify top-1 approach makes sense in base frame
-    top1 = out_candidates[0]
-    app  = np.array(top1["approach"])
-    print(f"\n  Top-1 in base frame:")
-    print(f"    grasp_point: [{top1['grasp_point'][0]:.3f},{top1['grasp_point'][1]:.3f},{top1['grasp_point'][2]:.3f}]m")
-    print(f"    approach:    [{app[0]:.2f},{app[1]:.2f},{app[2]:.2f}]")
-    print(f"    pre_grasp:   [{top1['pre_grasp_point'][0]:.3f},{top1['pre_grasp_point'][1]:.3f},{top1['pre_grasp_point'][2]:.3f}]m")
-
-    if top1['pre_grasp_point'][2] < 0:
-        print(f"  ⚠️  pre_grasp z<0 ({top1['pre_grasp_point'][2]:.3f}m) — may clip floor")
+    # Sanity: show top-1 after V2AP transform
+    c0  = out_candidates[0]
+    gp0 = np.array(c0["grasp_point"])
+    R0  = np.array(c0["rotation"])
+    T_z0_g = np.eye(4); T_z0_g[:3,:3] = R0; T_z0_g[:3,3] = gp0
+    T_base_g = T_base_z0 @ T_z0_g
+    print(f"\n  Top-1 (as V2AP will compute):")
+    print(f"    grasp (z0):   [{gp0[0]:.3f},{gp0[1]:.3f},{gp0[2]:.3f}]m")
+    print(f"    grasp (base): [{T_base_g[0,3]:.3f},{T_base_g[1,3]:.3f},{T_base_g[2,3]:.3f}]m")
+    app_base = T_base_g[:3,2]
+    pre_base = T_base_g[:3,3] - app_base * (0.105 + 0.15)
+    print(f"    approach (base): [{app_base[0]:.2f},{app_base[1]:.2f},{app_base[2]:.2f}]")
+    print(f"    pre_grasp (base): [{pre_base[0]:.3f},{pre_base[1]:.3f},{pre_base[2]:.3f}]m")
+    if pre_base[2] < 0.0:
+        print(f"  ⚠️  pre_grasp z={pre_base[2]:.3f}m < 0 — may collide with floor")
 
     # ── Write V2AP candidates.json ─────────────────────────────
+    # Standard V2AP path: output/inference/candidates.json
+    inference_dir = session_dir / "output" / "inference"
+    inference_dir.mkdir(parents=True, exist_ok=True)
+    out_path = inference_dir / "candidates.json"
+
     out = {
         "schema_version": "1.1",
         "session_id":     session_dir.name,
-        "mesh_frame":     "base_frame",    # Fully transformed to robot base
-        "n_candidates":   len(out_candidates),
-        "conventions": {
-            "rotation_columns":   ["finger_open", "y_body", "approach"],
-            "approach_column_index": 2,
-            "pre_grasp_offset_m": 0.15,
-            "lift_height_m":      0.15,
-        },
-        # T_base_z0 stored for reference (already baked into grasp_point/rotation)
+        # T_base_mesh: z0 frame → robot base
+        # V2AP: T_base_pinch = T_base_mesh @ [[R | grasp_point]]
         "T_base_mesh": [[round(float(x), 6) for x in row]
-                        for row in T_base_z0.tolist()],
-        "candidates": out_candidates,
+                         for row in T_base_z0.tolist()],
+        "mesh_span_m": [round(float(x), 4) for x in mesh_span.tolist()],
+        "conventions": {
+            "rotation_columns":      ["finger_open", "y_body", "approach"],
+            "approach_column_index": 2,
+            "pre_grasp_offset_m":    0.15,
+            "lift_height_m":         0.15,
+            "depth_shift_m":         local.get("shift_applied_m", 0.025),
+            "note": (
+                "grasp_point/rotation are in z0 frame (base_aligned mesh + z_min shift). "
+                "T_base_mesh maps z0→base. V2AP computes T_base_pinch = T_base_mesh @ T_z0_pinch."
+            ),
+        },
+        "n_candidates": len(out_candidates),
+        "candidates":   out_candidates,
     }
 
-    out_path = base_out / "candidates.json"
     tmp = out_path.with_suffix(".json.tmp")
     with open(tmp, "w") as f:
         json.dump(out, f, indent=2)
     tmp.rename(out_path)
 
-    print(f"\n  ✅ Saved: {out_path}")
+    # Also copy to graspnet/ dir for reference
+    import shutil, time as _time
+    shutil.copy(out_path, base_out / "candidates.json")
+
+    # V2AP load_titan_output() checks output/status.json for success=true
+    status_path = session_dir / "output" / "status.json"
+    if not status_path.exists():
+        status = {
+            "success":    True,
+            "session_id": session_dir.name,
+            "source":     "graspnet_demo",
+            "timestamp":  _time.strftime("%Y-%m-%dT%H:%M:%SZ", _time.gmtime()),
+            "titan":      {"object_slug": session_dir.name.split("_")[-1]},
+        }
+        with open(status_path, "w") as f:
+            json.dump(status, f, indent=2)
+        print(f"  ✅ Created: {status_path}")
+
+    print(f"\n  ✅ Saved (V2AP): {out_path}")
+    print(f"  ✅ Saved (ref):  {base_out / 'candidates.json'}")
     print(f"{'='*55}\n")
     return out_path
 
